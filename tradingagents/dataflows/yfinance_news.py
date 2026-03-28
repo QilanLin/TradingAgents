@@ -4,6 +4,8 @@ import yfinance as yf
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
+from .cache_utils import get_or_fetch_cached_text
+
 
 def _extract_article_data(article: dict) -> dict:
     """Extract article data from yfinance news format (handles nested 'content' structure)."""
@@ -62,14 +64,20 @@ def get_news_yfinance(
     Returns:
         Formatted string containing news articles
     """
-    try:
+    cache_key = {
+        "ticker": ticker.upper(),
+        "start_date": start_date,
+        "end_date": end_date,
+        "count": 20,
+    }
+
+    def fetch() -> str:
         stock = yf.Ticker(ticker)
         news = stock.get_news(count=20)
 
         if not news:
             return f"No news found for {ticker}"
 
-        # Parse date range for filtering
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
@@ -79,7 +87,6 @@ def get_news_yfinance(
         for article in news:
             data = _extract_article_data(article)
 
-            # Filter by date if publish time is available
             if data["pub_date"]:
                 pub_date_naive = data["pub_date"].replace(tzinfo=None)
                 if not (start_dt <= pub_date_naive <= end_dt + relativedelta(days=1)):
@@ -98,6 +105,8 @@ def get_news_yfinance(
 
         return f"## {ticker} News, from {start_date} to {end_date}:\n\n{news_str}"
 
+    try:
+        return get_or_fetch_cached_text("yfinance_news", cache_key, fetch)
     except Exception as e:
         return f"Error fetching news for {ticker}: {str(e)}"
 
@@ -118,18 +127,23 @@ def get_global_news_yfinance(
     Returns:
         Formatted string containing global news articles
     """
-    # Search queries for macro/global news
-    search_queries = [
-        "stock market economy",
-        "Federal Reserve interest rates",
-        "inflation economic outlook",
-        "global markets trading",
-    ]
+    cache_key = {
+        "curr_date": curr_date,
+        "look_back_days": look_back_days,
+        "limit": limit,
+    }
 
-    all_news = []
-    seen_titles = set()
+    def fetch() -> str:
+        search_queries = [
+            "stock market economy",
+            "Federal Reserve interest rates",
+            "inflation economic outlook",
+            "global markets trading",
+        ]
 
-    try:
+        all_news = []
+        seen_titles = set()
+
         for query in search_queries:
             search = yf.Search(
                 query=query,
@@ -139,14 +153,12 @@ def get_global_news_yfinance(
 
             if search.news:
                 for article in search.news:
-                    # Handle both flat and nested structures
                     if "content" in article:
                         data = _extract_article_data(article)
                         title = data["title"]
                     else:
                         title = article.get("title", "")
 
-                    # Deduplicate by title
                     if title and title not in seen_titles:
                         seen_titles.add(title)
                         all_news.append(article)
@@ -157,14 +169,12 @@ def get_global_news_yfinance(
         if not all_news:
             return f"No global news found for {curr_date}"
 
-        # Calculate date range
         curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
         start_dt = curr_dt - relativedelta(days=look_back_days)
         start_date = start_dt.strftime("%Y-%m-%d")
 
         news_str = ""
         for article in all_news[:limit]:
-            # Handle both flat and nested structures
             if "content" in article:
                 data = _extract_article_data(article)
                 title = data["title"]
@@ -186,5 +196,7 @@ def get_global_news_yfinance(
 
         return f"## Global Market News, from {start_date} to {curr_date}:\n\n{news_str}"
 
+    try:
+        return get_or_fetch_cached_text("yfinance_global_news", cache_key, fetch)
     except Exception as e:
         return f"Error fetching global news: {str(e)}"

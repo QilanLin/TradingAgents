@@ -7,6 +7,9 @@ DEFAULT_CONFIG = {
         os.path.abspath(os.path.join(os.path.dirname(__file__), ".")),
         "dataflows/data_cache",
     ),
+    "data_cache_ttl_seconds": int(
+        os.getenv("TRADINGAGENTS_DATA_CACHE_TTL_SECONDS", str(24 * 60 * 60))
+    ),
     # LLM settings
     "llm_provider": "openai",
     "deep_think_llm": "gpt-5.2",

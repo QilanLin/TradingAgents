@@ -3,7 +3,58 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import yfinance as yf
 import os
+import pandas as pd
+
+from .cache_utils import get_cache_ttl_seconds, get_or_fetch_cached_text
+from .config import get_config
 from .stockstats_utils import StockstatsUtils, _clean_dataframe, yf_retry
+
+
+def _yfinance_history_cache_path(symbol: str) -> tuple[str, str, str]:
+    config = get_config()
+    today_date = pd.Timestamp.today()
+    start_date = today_date - pd.DateOffset(years=15)
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = today_date.strftime("%Y-%m-%d")
+
+    os.makedirs(config["data_cache_dir"], exist_ok=True)
+    data_file = os.path.join(
+        config["data_cache_dir"],
+        f"{symbol.upper()}-YFin-data-{start_date_str}-{end_date_str}.csv",
+    )
+    return data_file, start_date_str, end_date_str
+
+
+def _load_cached_yfinance_history(symbol: str) -> pd.DataFrame:
+    data_file, start_date_str, end_date_str = _yfinance_history_cache_path(symbol)
+    ttl_seconds = get_cache_ttl_seconds()
+    cache_is_fresh = (
+        os.path.exists(data_file)
+        and (datetime.now().timestamp() - os.path.getmtime(data_file)) <= ttl_seconds
+    )
+
+    if cache_is_fresh:
+        return pd.read_csv(data_file, on_bad_lines="skip")
+
+    try:
+        data = yf_retry(
+            lambda: yf.download(
+                symbol,
+                start=start_date_str,
+                end=end_date_str,
+                multi_level_index=False,
+                progress=False,
+                auto_adjust=True,
+            )
+        )
+        data = data.reset_index()
+        data.to_csv(data_file, index=False)
+        return data
+    except Exception:
+        if os.path.exists(data_file):
+            return pd.read_csv(data_file, on_bad_lines="skip")
+        raise
+
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
@@ -14,32 +65,24 @@ def get_YFin_data_online(
     datetime.strptime(start_date, "%Y-%m-%d")
     datetime.strptime(end_date, "%Y-%m-%d")
 
-    # Create ticker object
-    ticker = yf.Ticker(symbol.upper())
+    history = _load_cached_yfinance_history(symbol)
+    history["Date"] = pd.to_datetime(history["Date"], errors="coerce")
+    history = history.dropna(subset=["Date"])
 
-    # Fetch historical data for the specified date range
-    data = yf_retry(lambda: ticker.history(start=start_date, end=end_date))
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+    data = history[(history["Date"] >= start_dt) & (history["Date"] <= end_dt)].copy()
 
-    # Check if data is empty
     if data.empty:
-        return (
-            f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
-        )
+        return f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
 
-    # Remove timezone info from index for cleaner output
-    if data.index.tz is not None:
-        data.index = data.index.tz_localize(None)
-
-    # Round numerical values to 2 decimal places for cleaner display
     numeric_columns = ["Open", "High", "Low", "Close", "Adj Close"]
     for col in numeric_columns:
         if col in data.columns:
-            data[col] = data[col].round(2)
+            data[col] = pd.to_numeric(data[col], errors="coerce").round(2)
 
-    # Convert DataFrame to CSV string
-    csv_string = data.to_csv()
+    csv_string = data.to_csv(index=False)
 
-    # Add header information
     header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
     header += f"# Total records: {len(data)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -194,10 +237,7 @@ def _get_stock_stats_bulk(
     Fetches data once and calculates indicator for all available dates.
     Returns dict mapping date strings to indicator values.
     """
-    from .config import get_config
-    import pandas as pd
     from stockstats import wrap
-    import os
     
     config = get_config()
     online = config["data_vendors"]["technical_indicators"] != "local"
@@ -215,35 +255,7 @@ def _get_stock_stats_bulk(
         except FileNotFoundError:
             raise Exception("Stockstats fail: Yahoo Finance data not fetched yet!")
     else:
-        # Online data fetching with caching
-        today_date = pd.Timestamp.today()
-        curr_date_dt = pd.to_datetime(curr_date)
-
-        end_date = today_date
-        start_date = today_date - pd.DateOffset(years=15)
-        start_date_str = start_date.strftime("%Y-%m-%d")
-        end_date_str = end_date.strftime("%Y-%m-%d")
-
-        os.makedirs(config["data_cache_dir"], exist_ok=True)
-
-        data_file = os.path.join(
-            config["data_cache_dir"],
-            f"{symbol}-YFin-data-{start_date_str}-{end_date_str}.csv",
-        )
-
-        if os.path.exists(data_file):
-            data = pd.read_csv(data_file, on_bad_lines="skip")
-        else:
-            data = yf_retry(lambda: yf.download(
-                symbol,
-                start=start_date_str,
-                end=end_date_str,
-                multi_level_index=False,
-                progress=False,
-                auto_adjust=True,
-            ))
-            data = data.reset_index()
-            data.to_csv(data_file, index=False)
+        data = _load_cached_yfinance_history(symbol)
 
     data = _clean_dataframe(data)
     df = wrap(data)
@@ -298,7 +310,12 @@ def get_fundamentals(
     curr_date: Annotated[str, "current date (not used for yfinance)"] = None
 ):
     """Get company fundamentals overview from yfinance."""
-    try:
+    cache_key = {
+        "ticker": ticker.upper(),
+        "dataset": "fundamentals",
+    }
+
+    def fetch() -> str:
         ticker_obj = yf.Ticker(ticker.upper())
         info = yf_retry(lambda: ticker_obj.info)
 
@@ -346,6 +363,8 @@ def get_fundamentals(
 
         return header + "\n".join(lines)
 
+    try:
+        return get_or_fetch_cached_text("yfinance_fundamentals", cache_key, fetch)
     except Exception as e:
         return f"Error retrieving fundamentals for {ticker}: {str(e)}"
 
@@ -356,26 +375,32 @@ def get_balance_sheet(
     curr_date: Annotated[str, "current date (not used for yfinance)"] = None
 ):
     """Get balance sheet data from yfinance."""
-    try:
+    cache_key = {
+        "ticker": ticker.upper(),
+        "dataset": "balance_sheet",
+        "freq": freq.lower(),
+    }
+
+    def fetch() -> str:
         ticker_obj = yf.Ticker(ticker.upper())
 
         if freq.lower() == "quarterly":
             data = yf_retry(lambda: ticker_obj.quarterly_balance_sheet)
         else:
             data = yf_retry(lambda: ticker_obj.balance_sheet)
-            
+
         if data.empty:
             return f"No balance sheet data found for symbol '{ticker}'"
-            
-        # Convert to CSV string for consistency with other functions
+
         csv_string = data.to_csv()
-        
-        # Add header information
+
         header = f"# Balance Sheet data for {ticker.upper()} ({freq})\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
+
         return header + csv_string
-        
+
+    try:
+        return get_or_fetch_cached_text("yfinance_balance_sheet", cache_key, fetch)
     except Exception as e:
         return f"Error retrieving balance sheet for {ticker}: {str(e)}"
 
@@ -386,26 +411,32 @@ def get_cashflow(
     curr_date: Annotated[str, "current date (not used for yfinance)"] = None
 ):
     """Get cash flow data from yfinance."""
-    try:
+    cache_key = {
+        "ticker": ticker.upper(),
+        "dataset": "cashflow",
+        "freq": freq.lower(),
+    }
+
+    def fetch() -> str:
         ticker_obj = yf.Ticker(ticker.upper())
 
         if freq.lower() == "quarterly":
             data = yf_retry(lambda: ticker_obj.quarterly_cashflow)
         else:
             data = yf_retry(lambda: ticker_obj.cashflow)
-            
+
         if data.empty:
             return f"No cash flow data found for symbol '{ticker}'"
-            
-        # Convert to CSV string for consistency with other functions
+
         csv_string = data.to_csv()
-        
-        # Add header information
+
         header = f"# Cash Flow data for {ticker.upper()} ({freq})\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
+
         return header + csv_string
-        
+
+    try:
+        return get_or_fetch_cached_text("yfinance_cashflow", cache_key, fetch)
     except Exception as e:
         return f"Error retrieving cash flow for {ticker}: {str(e)}"
 
@@ -416,26 +447,32 @@ def get_income_statement(
     curr_date: Annotated[str, "current date (not used for yfinance)"] = None
 ):
     """Get income statement data from yfinance."""
-    try:
+    cache_key = {
+        "ticker": ticker.upper(),
+        "dataset": "income_statement",
+        "freq": freq.lower(),
+    }
+
+    def fetch() -> str:
         ticker_obj = yf.Ticker(ticker.upper())
 
         if freq.lower() == "quarterly":
             data = yf_retry(lambda: ticker_obj.quarterly_income_stmt)
         else:
             data = yf_retry(lambda: ticker_obj.income_stmt)
-            
+
         if data.empty:
             return f"No income statement data found for symbol '{ticker}'"
-            
-        # Convert to CSV string for consistency with other functions
+
         csv_string = data.to_csv()
-        
-        # Add header information
+
         header = f"# Income Statement data for {ticker.upper()} ({freq})\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
+
         return header + csv_string
-        
+
+    try:
+        return get_or_fetch_cached_text("yfinance_income_statement", cache_key, fetch)
     except Exception as e:
         return f"Error retrieving income statement for {ticker}: {str(e)}"
 
@@ -444,21 +481,26 @@ def get_insider_transactions(
     ticker: Annotated[str, "ticker symbol of the company"]
 ):
     """Get insider transactions data from yfinance."""
-    try:
+    cache_key = {
+        "ticker": ticker.upper(),
+        "dataset": "insider_transactions",
+    }
+
+    def fetch() -> str:
         ticker_obj = yf.Ticker(ticker.upper())
         data = yf_retry(lambda: ticker_obj.insider_transactions)
-        
+
         if data is None or data.empty:
             return f"No insider transactions data found for symbol '{ticker}'"
-            
-        # Convert to CSV string for consistency with other functions
+
         csv_string = data.to_csv()
-        
-        # Add header information
+
         header = f"# Insider Transactions data for {ticker.upper()}\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
+
         return header + csv_string
-        
+
+    try:
+        return get_or_fetch_cached_text("yfinance_insider_transactions", cache_key, fetch)
     except Exception as e:
         return f"Error retrieving insider transactions for {ticker}: {str(e)}"

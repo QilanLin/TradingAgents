@@ -5,6 +5,8 @@ import json
 from datetime import datetime
 from io import StringIO
 
+from .cache_utils import get_or_fetch_cached_text
+
 API_BASE_URL = "https://www.alphavantage.co/query"
 
 def get_api_key() -> str:
@@ -39,6 +41,36 @@ class AlphaVantageRateLimitError(Exception):
     """Exception raised when Alpha Vantage API rate limit is exceeded."""
     pass
 
+
+def _alpha_vantage_cache_key(function_name: str, params: dict) -> dict:
+    return {
+        "function": function_name,
+        "params": {k: params[k] for k in sorted(params)},
+    }
+
+
+def _raise_for_alpha_vantage_response_errors(response_text: str) -> None:
+    try:
+        response_json = json.loads(response_text)
+    except json.JSONDecodeError:
+        return
+
+    note_message = response_json.get("Note")
+    if note_message:
+        raise AlphaVantageRateLimitError(f"Alpha Vantage rate limit exceeded: {note_message}")
+
+    info_message = response_json.get("Information")
+    if info_message:
+        lowered = info_message.lower()
+        if (
+            "rate limit" in lowered
+            or "api key" in lowered
+            or "premium" in lowered
+            or "call frequency" in lowered
+        ):
+            raise AlphaVantageRateLimitError(f"Alpha Vantage request unavailable: {info_message}")
+
+
 def _make_api_request(function_name: str, params: dict) -> dict | str:
     """Helper function to make API requests and handle responses.
     
@@ -62,25 +94,29 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
     elif "entitlement" in api_params:
         # Remove entitlement if it's None or empty
         api_params.pop("entitlement", None)
-    
-    response = requests.get(API_BASE_URL, params=api_params)
-    response.raise_for_status()
 
-    response_text = response.text
-    
-    # Check if response is JSON (error responses are typically JSON)
-    try:
-        response_json = json.loads(response_text)
-        # Check for rate limit error
-        if "Information" in response_json:
-            info_message = response_json["Information"]
-            if "rate limit" in info_message.lower() or "api key" in info_message.lower():
-                raise AlphaVantageRateLimitError(f"Alpha Vantage rate limit exceeded: {info_message}")
-    except json.JSONDecodeError:
-        # Response is not JSON (likely CSV data), which is normal
-        pass
+    cache_key = _alpha_vantage_cache_key(
+        function_name,
+        {
+            k: v
+            for k, v in api_params.items()
+            if k not in {"apikey", "source"}
+        },
+    )
 
-    return response_text
+    def fetch() -> str:
+        response = requests.get(API_BASE_URL, params=api_params)
+        response.raise_for_status()
+        response_text = response.text
+        _raise_for_alpha_vantage_response_errors(response_text)
+        return response_text
+
+    return get_or_fetch_cached_text(
+        "alpha_vantage",
+        cache_key,
+        fetch,
+        fallback_exceptions=(requests.RequestException, AlphaVantageRateLimitError),
+    )
 
 
 
