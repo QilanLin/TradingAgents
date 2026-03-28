@@ -205,6 +205,42 @@ class DataflowCachingTests(unittest.TestCase):
             self.assertEqual(second[0]["status"], "hit")
             self.assertEqual(second[0]["rows"], 2)
 
+    def test_warm_yfinance_history_cache_replaces_invalid_empty_cache_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_config(
+                {
+                    "data_cache_dir": tmpdir,
+                    "data_cache_ttl_seconds": 3600,
+                }
+            )
+
+            stale_path = (
+                Path(tmpdir)
+                / "AAPL-YFin-data-2011-03-28-2026-03-28.csv"
+            )
+            pd.DataFrame(columns=["Date", "Close"]).to_csv(stale_path, index=False)
+
+            sample = pd.DataFrame(
+                {
+                    "Date": ["2025-09-02", "2025-09-03"],
+                    "Open": [100.0, 101.0],
+                    "High": [101.0, 102.0],
+                    "Low": [99.0, 100.0],
+                    "Close": [100.5, 101.5],
+                    "Volume": [1000, 1200],
+                }
+            )
+
+            with patch("tradingagents.dataflows.y_finance.yf.download", return_value=sample):
+                result = warm_yfinance_history_cache(["AAPL"])
+
+            self.assertEqual(result[0]["rows"], 2)
+            self.assertIn(result[0]["status"], {"fetched", "hit"})
+            self.assertTrue(Path(result[0]["path"]).exists())
+
+            reloaded = pd.read_csv(result[0]["path"])
+            self.assertEqual(len(reloaded), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

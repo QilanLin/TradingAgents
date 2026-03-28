@@ -25,6 +25,13 @@ def _yfinance_history_cache_path(symbol: str) -> tuple[str, str, str]:
     return data_file, start_date_str, end_date_str
 
 
+def _read_yfinance_history_file(data_file: str) -> pd.DataFrame:
+    data = pd.read_csv(data_file, on_bad_lines="skip")
+    if data.empty or "Date" not in data.columns:
+        raise ValueError(f"Invalid Yahoo Finance cache file: {data_file}")
+    return data
+
+
 def _load_cached_yfinance_history(symbol: str) -> pd.DataFrame:
     data_file, start_date_str, end_date_str = _yfinance_history_cache_path(symbol)
     ttl_seconds = get_cache_ttl_seconds()
@@ -34,7 +41,10 @@ def _load_cached_yfinance_history(symbol: str) -> pd.DataFrame:
     )
 
     if cache_is_fresh:
-        return pd.read_csv(data_file, on_bad_lines="skip")
+        try:
+            return _read_yfinance_history_file(data_file)
+        except Exception:
+            os.remove(data_file)
 
     try:
         data = yf_retry(
@@ -54,7 +64,13 @@ def _load_cached_yfinance_history(symbol: str) -> pd.DataFrame:
         return data
     except Exception:
         if os.path.exists(data_file):
-            return pd.read_csv(data_file, on_bad_lines="skip")
+            try:
+                return _read_yfinance_history_file(data_file)
+            except Exception:
+                try:
+                    os.remove(data_file)
+                except OSError:
+                    pass
         return pd.DataFrame()
 
 
