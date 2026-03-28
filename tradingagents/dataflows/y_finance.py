@@ -48,12 +48,14 @@ def _load_cached_yfinance_history(symbol: str) -> pd.DataFrame:
             )
         )
         data = data.reset_index()
+        if data.empty:
+            raise ValueError(f"Yahoo Finance returned no history for {symbol}")
         data.to_csv(data_file, index=False)
         return data
     except Exception:
         if os.path.exists(data_file):
             return pd.read_csv(data_file, on_bad_lines="skip")
-        raise
+        return pd.DataFrame()
 
 
 def get_YFin_data_online(
@@ -66,6 +68,9 @@ def get_YFin_data_online(
     datetime.strptime(end_date, "%Y-%m-%d")
 
     history = _load_cached_yfinance_history(symbol)
+    if history.empty or "Date" not in history.columns:
+        return f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
+
     history["Date"] = pd.to_datetime(history["Date"], errors="coerce")
     history = history.dropna(subset=["Date"])
 
@@ -256,6 +261,9 @@ def _get_stock_stats_bulk(
             raise Exception("Stockstats fail: Yahoo Finance data not fetched yet!")
     else:
         data = _load_cached_yfinance_history(symbol)
+
+    if data.empty or "Date" not in data.columns:
+        raise Exception(f"No price history available for {symbol}")
 
     data = _clean_dataframe(data)
     df = wrap(data)

@@ -6,12 +6,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pandas as pd
+
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.dataflows import alpha_vantage_common
 from tradingagents.dataflows.alpha_vantage_common import _make_api_request
 from tradingagents.dataflows.cache_utils import get_or_fetch_cached_text, save_cached_text
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.yfinance_news import get_news_yfinance
+from tradingagents.dataflows.y_finance import get_YFin_data_online
 
 
 class DataflowCachingTests(unittest.TestCase):
@@ -146,6 +149,22 @@ class DataflowCachingTests(unittest.TestCase):
 
             self.assertEqual(first, second)
             self.assertIn("Apple launches update", second)
+
+    def test_yfinance_history_does_not_cache_empty_downloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_config(
+                {
+                    "data_cache_dir": tmpdir,
+                    "data_cache_ttl_seconds": 3600,
+                }
+            )
+
+            empty_history = pd.DataFrame()
+            with patch("tradingagents.dataflows.y_finance.yf.download", return_value=empty_history):
+                result = get_YFin_data_online("AAPL", "2025-09-01", "2025-09-05")
+
+            self.assertIn("No data found", result)
+            self.assertEqual(list(Path(tmpdir).glob("*YFin-data-*.csv")), [])
 
 
 if __name__ == "__main__":
