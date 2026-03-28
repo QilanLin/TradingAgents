@@ -41,6 +41,13 @@ PRICE_CANDIDATES = [
 ]
 
 
+def get_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
+
+
 def extract_rating(text: str) -> str:
     upper = (text or "").upper()
     for token in ["OVERWEIGHT", "UNDERWEIGHT", "BUY", "SELL", "HOLD"]:
@@ -102,7 +109,7 @@ class LocalQwenClientAdapter:
             local = mod.LocalQwenChat(
                 model_name=self.model,
                 temperature=0.0,
-                max_tokens=20000,
+                max_tokens=get_env_int("TRADINGAGENTS_LOCAL_QWEN_MAX_TOKENS", 20000),
             )
             self._cache[self.model] = RunnableLocalQwen(local)
         return self._cache[self.model]
@@ -228,8 +235,14 @@ def main() -> None:
     # 这两个值之前被手工改成 0 / 0，会让这条 harness 跳过 Bear Researcher、
     # Conservative Analyst、Neutral Analyst，使结果不再代表默认 TradingAgents 流程。
     # DEFAULT_CONFIG 里的默认值是 1 / 1，因此这里显式对齐回默认配置。
-    cfg["max_debate_rounds"] = DEFAULT_CONFIG["max_debate_rounds"]
-    cfg["max_risk_discuss_rounds"] = DEFAULT_CONFIG["max_risk_discuss_rounds"]
+    cfg["max_debate_rounds"] = get_env_int(
+        "TRADINGAGENTS_MAX_DEBATE_ROUNDS",
+        DEFAULT_CONFIG["max_debate_rounds"],
+    )
+    cfg["max_risk_discuss_rounds"] = get_env_int(
+        "TRADINGAGENTS_MAX_RISK_DISCUSS_ROUNDS",
+        DEFAULT_CONFIG["max_risk_discuss_rounds"],
+    )
     # Keep repository-default vendors here. Forcing every tool through Alpha Vantage
     # makes smoke tests brittle because some endpoints are premium and the free quota
     # is too small for a full multi-agent run.
@@ -262,7 +275,7 @@ def main() -> None:
             "cash_ticker": CASH_TICKER,
             "months": MONTHS,
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "max_tokens": 20000,
+            "max_tokens": get_env_int("TRADINGAGENTS_LOCAL_QWEN_MAX_TOKENS", 20000),
             "max_debate_rounds": cfg["max_debate_rounds"],
             "max_risk_discuss_rounds": cfg["max_risk_discuss_rounds"],
             "portfolio_adapter": "cash_aware_slot_fraction",
