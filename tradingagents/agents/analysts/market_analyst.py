@@ -1,10 +1,14 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 import time
 import json
+from datetime import datetime, timedelta
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
+    ensure_tool_calls_attr,
     get_indicators,
     get_stock_data,
+    is_local_qwen_like,
+    safe_tool_invoke,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -13,6 +17,7 @@ def create_market_analyst(llm):
 
     def market_analyst_node(state):
         current_date = state["trade_date"]
+        ticker = state["company_of_interest"]
         instrument_context = build_instrument_context(state["company_of_interest"])
 
         tools = [
@@ -71,14 +76,59 @@ Volume-Based Indicators:
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        chain = prompt | llm.bind_tools(tools)
+        if is_local_qwen_like(llm):
+            end_date = current_date
+            start_date = (
+                datetime.strptime(current_date, "%Y-%m-%d") - timedelta(days=420)
+            ).strftime("%Y-%m-%d")
 
-        result = chain.invoke(state["messages"])
+            # Local HF Qwen does not support LangChain function calling.
+            # Execute the bound tools explicitly, then ask the model to analyze them.
+            ohlcv = safe_tool_invoke(
+                get_stock_data,
+                {"symbol": ticker, "start_date": start_date, "end_date": end_date}
+            )
+            indicators = [
+                "close_10_ema",
+                "close_50_sma",
+                "close_200_sma",
+                "macd",
+                "macdh",
+                "rsi",
+                "atr",
+                "vwma",
+            ]
+            ind_blocks = []
+            for ind in indicators:
+                ind_out = safe_tool_invoke(
+                    get_indicators,
+                    {
+                        "symbol": ticker,
+                        "indicator": ind,
+                        "curr_date": current_date,
+                        "look_back_days": 220,
+                    }
+                )
+                ind_blocks.append(f"### {ind}\n{ind_out}")
 
-        report = ""
-
-        if len(result.tool_calls) == 0:
-            report = result.content
+            local_prompt = (
+                f"{system_message}\n\n"
+                "NOTE: You are running in LOCAL mode. The required tools have already "
+                "been executed for you. Do NOT request tools; analyze the retrieved "
+                "data below directly.\n\n"
+                f"Ticker: {ticker}\nTrade date: {current_date}\n\n"
+                f"## OHLCV (approx. last 420 days)\n{ohlcv}\n\n"
+                f"## Indicator outputs\n" + "\n\n".join(ind_blocks)
+            )
+            result = llm.invoke(local_prompt)
+            report = getattr(result, "content", "")
+            ensure_tool_calls_attr(result)
+        else:
+            chain = prompt | llm.bind_tools(tools)
+            result = chain.invoke(state["messages"])
+            report = ""
+            if len(result.tool_calls) == 0:
+                report = result.content
 
         return {
             "messages": [result],

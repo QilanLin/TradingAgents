@@ -1,0 +1,283 @@
+import csv
+import importlib.util
+import json
+import math
+import os
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List
+
+import numpy as np
+import pandas as pd
+from langchain_core.runnables import Runnable
+
+from tradingagents.default_config import DEFAULT_CONFIG
+import tradingagents.graph.trading_graph as tg
+
+
+TICKERS = ["AAPL", "GOOGL", "AMZN", "MSFT", "META", "TSLA", "NVDA"]
+CASH_TICKER = "CASH"
+MONTHS = {
+    "2025-09": ("2025-09-01", "2025-09-30"),
+    "2025-10": ("2025-10-01", "2025-10-31"),
+    "2026-01": ("2026-01-01", "2026-01-31"),
+}
+INITIAL_CAPITAL = 1_000_000.0
+RISK_FREE_RATE = 0.05
+RATING_SCORE = {
+    "BUY": 1.0,
+    "OVERWEIGHT": 0.75,
+    "HOLD": 0.5,
+    "UNDERWEIGHT": 0.25,
+    "SELL": 0.0,
+}
+
+PRICE_CANDIDATES = [
+    "/root/private_data/experiments0202change/data_cache/price/{ticker}_plain_daily_2024-09-30_2025-09-30.csv",
+    "/root/private_data/data_cache/price/{ticker}_adjusted_2024-10-31_2025-10-31.csv",
+    "/root/private_data/data_cache/price/{ticker}_plain_daily_2025-01-31_2026-01-31.csv",
+    "/root/private_data/data_cache/price/{ticker}_adjusted_2025-01-16_2026-01-16.csv",
+]
+
+
+def extract_rating(text: str) -> str:
+    upper = (text or "").upper()
+    for token in ["OVERWEIGHT", "UNDERWEIGHT", "BUY", "SELL", "HOLD"]:
+        if token in upper:
+            return token
+    return "HOLD"
+
+
+def load_prices(ticker: str) -> pd.Series:
+    frames: List[pd.DataFrame] = []
+    for pat in PRICE_CANDIDATES:
+        path = pat.format(ticker=ticker)
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            if "date" not in df.columns:
+                continue
+            close_col = "raw_close" if "raw_close" in df.columns else "close"
+            if close_col not in df.columns:
+                continue
+            frames.append(df[["date", close_col]].rename(columns={close_col: "close"}))
+    if not frames:
+        raise RuntimeError(f"No price files found for {ticker}")
+
+    merged = pd.concat(frames, ignore_index=True)
+    merged["date"] = pd.to_datetime(merged["date"])
+    merged = merged.dropna(subset=["close"]).drop_duplicates(subset=["date"], keep="last")
+    merged = merged.sort_values("date")
+    s = pd.Series(merged["close"].values, index=merged["date"].dt.strftime("%Y-%m-%d"))
+    return s
+
+
+class RunnableLocalQwen(Runnable):
+    def __init__(self, inner):
+        self.inner = inner
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, input, config=None, **kwargs):
+        if hasattr(input, "to_messages"):
+            input = input.to_messages()
+        return self.inner.invoke(input)
+
+
+class LocalQwenClientAdapter:
+    _cache: Dict[str, RunnableLocalQwen] = {}
+
+    def __init__(self, model: str, base_url=None, **kwargs):
+        self.model = model
+
+    def get_llm(self):
+        if self.model not in self._cache:
+            spec = importlib.util.spec_from_file_location(
+                "local_qwen_mod",
+                "/root/private_data/tradingagents_tsfm_modified_v5/tradingagents/llms/local_qwen.py",
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            local = mod.LocalQwenChat(
+                model_name=self.model,
+                temperature=0.0,
+                max_tokens=20000,
+            )
+            self._cache[self.model] = RunnableLocalQwen(local)
+        return self._cache[self.model]
+
+    def validate_model(self):
+        return True
+
+
+def patched_create_llm_client(provider: str, model: str, base_url=None, **kwargs):
+    return LocalQwenClientAdapter(model=model, base_url=base_url, **kwargs)
+
+
+@dataclass
+class MonthResult:
+    month: str
+    trading_days: int
+    final_value: float
+    total_return: float
+    annualized_return: float
+    sharpe_ratio: float
+    max_drawdown: float
+
+
+def compute_max_drawdown(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    arr = np.array(values, dtype=float)
+    running_max = np.maximum.accumulate(arr)
+    drawdowns = (arr - running_max) / running_max
+    return float(drawdowns.min())
+
+
+def run_month(month: str, start: str, end: str, ta, price_map: Dict[str, pd.Series], decisions_writer) -> MonthResult:
+    all_days = sorted(
+        d
+        for d in price_map[TICKERS[0]].index
+        if start <= d <= end
+        and all(d in price_map[t].index for t in TICKERS)
+    )
+    if not all_days:
+        raise RuntimeError(f"No trading days for {month}")
+
+    first_day = all_days[0]
+    shares = {
+        t: (INITIAL_CAPITAL / len(TICKERS)) / float(price_map[t][first_day])
+        for t in TICKERS
+    }
+    cash = 0.0
+
+    portfolio_values: List[float] = []
+    daily_returns: List[float] = []
+    prev_value = INITIAL_CAPITAL
+    base_slot_weight = 1.0 / len(TICKERS)
+
+    for i, day in enumerate(all_days, start=1):
+        prices = {t: float(price_map[t][day]) for t in TICKERS}
+        value = float(cash + sum(shares[t] * prices[t] for t in TICKERS))
+        portfolio_values.append(value)
+
+        dr = (value - prev_value) / prev_value if prev_value > 0 else 0.0
+        daily_returns.append(float(dr))
+        prev_value = value
+
+        ratings = {}
+        for t in TICKERS:
+            _, signal = ta.propagate(t, day)
+            rating = extract_rating(signal)
+            ratings[t] = rating
+            decisions_writer.writerow([month, day, t, rating, signal])
+
+        # 更公平的 CASH-aware adapter：
+        # 每只股票先分到自己的基础槽位 1/7，再按 rating 决定占用该槽位的比例；
+        # 没有用掉的剩余权重全部进入现金，而不是把所有正分数强行归一化成满仓股票。
+        target_weights = {
+            t: base_slot_weight * RATING_SCORE.get(ratings[t], 0.5)
+            for t in TICKERS
+        }
+        cash_weight = max(0.0, 1.0 - sum(target_weights.values()))
+
+        shares = {
+            t: (value * target_weights[t]) / prices[t] if prices[t] > 0 else 0.0
+            for t in TICKERS
+        }
+        cash = value * cash_weight
+
+        print(
+            f"[{month}] {i}/{len(all_days)} {day} value={value:.2f} "
+            f"cash_weight={cash_weight:.4f} ratings={ratings}",
+            flush=True,
+        )
+
+    final_value = portfolio_values[-1]
+    total_return = final_value / INITIAL_CAPITAL - 1.0
+    annualized = (1.0 + total_return) ** (252.0 / max(len(all_days), 1)) - 1.0
+
+    ret_arr = np.array(daily_returns[1:], dtype=float) if len(daily_returns) > 1 else np.array([], dtype=float)
+    if ret_arr.size > 1 and float(np.std(ret_arr)) > 0:
+        excess = ret_arr - (RISK_FREE_RATE / 252.0)
+        sharpe = float(math.sqrt(252.0) * np.mean(excess) / np.std(ret_arr))
+    else:
+        sharpe = 0.0
+
+    mdd = compute_max_drawdown(portfolio_values)
+    return MonthResult(
+        month=month,
+        trading_days=len(all_days),
+        final_value=float(final_value),
+        total_return=float(total_return),
+        annualized_return=float(annualized),
+        sharpe_ratio=float(sharpe),
+        max_drawdown=float(mdd),
+    )
+
+
+def main() -> None:
+    tg.create_llm_client = patched_create_llm_client
+
+    cfg = DEFAULT_CONFIG.copy()
+    cfg["llm_provider"] = "openai"
+    cfg["deep_think_llm"] = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    cfg["quick_think_llm"] = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    # 恢复为仓库默认轮数。
+    # 这两个值之前被手工改成 0 / 0，会让这条 harness 跳过 Bear Researcher、
+    # Conservative Analyst、Neutral Analyst，使结果不再代表默认 TradingAgents 流程。
+    # DEFAULT_CONFIG 里的默认值是 1 / 1，因此这里显式对齐回默认配置。
+    cfg["max_debate_rounds"] = DEFAULT_CONFIG["max_debate_rounds"]
+    cfg["max_risk_discuss_rounds"] = DEFAULT_CONFIG["max_risk_discuss_rounds"]
+    cfg["data_vendors"] = {
+        "core_stock_apis": "alpha_vantage",
+        "technical_indicators": "alpha_vantage",
+        "fundamental_data": "alpha_vantage",
+        "news_data": "alpha_vantage",
+    }
+
+    ta = tg.TradingAgentsGraph(debug=False, config=cfg)
+    price_map = {t: load_prices(t) for t in TICKERS}
+
+    run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(f"/root/private_data/logs/tradingagents_official_3months_{run_id}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    decisions_csv = out_dir / "decisions.csv"
+    summary_json = out_dir / "summary.json"
+
+    results: List[MonthResult] = []
+    with decisions_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["month", "date", "ticker", "rating", "signal_raw"])
+        for month, (start, end) in MONTHS.items():
+            print(f"=== Running month {month} ({start} to {end}) ===", flush=True)
+            r = run_month(month, start, end, ta, price_map, writer)
+            results.append(r)
+            print(f"=== Done {month}: total={r.total_return:.4%}, sharpe={r.sharpe_ratio:.4f} ===", flush=True)
+
+    payload = {
+        "run_id": run_id,
+        "generated_utc": datetime.utcnow().isoformat() + "Z",
+        "config": {
+            "tickers": TICKERS,
+            "cash_ticker": CASH_TICKER,
+            "months": MONTHS,
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "max_tokens": 20000,
+            "max_debate_rounds": cfg["max_debate_rounds"],
+            "max_risk_discuss_rounds": cfg["max_risk_discuss_rounds"],
+            "portfolio_adapter": "cash_aware_slot_fraction",
+            "rating_score": RATING_SCORE,
+        },
+        "monthly_results": [r.__dict__ for r in results],
+    }
+    summary_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    print(f"SUMMARY_JSON={summary_json}", flush=True)
+    print(f"DECISIONS_CSV={decisions_csv}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

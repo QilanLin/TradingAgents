@@ -3,11 +3,14 @@ import time
 import json
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
+    ensure_tool_calls_attr,
     get_balance_sheet,
     get_cashflow,
     get_fundamentals,
     get_income_statement,
     get_insider_transactions,
+    is_local_qwen_like,
+    safe_tool_invoke,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -15,6 +18,7 @@ from tradingagents.dataflows.config import get_config
 def create_fundamentals_analyst(llm):
     def fundamentals_analyst_node(state):
         current_date = state["trade_date"]
+        ticker = state["company_of_interest"]
         instrument_context = build_instrument_context(state["company_of_interest"])
 
         tools = [
@@ -52,14 +56,44 @@ def create_fundamentals_analyst(llm):
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        chain = prompt | llm.bind_tools(tools)
+        if is_local_qwen_like(llm):
+            fundamentals_blob = safe_tool_invoke(
+                get_fundamentals,
+                {"ticker": ticker, "curr_date": current_date}
+            )
+            bs_blob = safe_tool_invoke(
+                get_balance_sheet,
+                {"ticker": ticker, "freq": "quarterly", "curr_date": current_date}
+            )
+            cf_blob = safe_tool_invoke(
+                get_cashflow,
+                {"ticker": ticker, "freq": "quarterly", "curr_date": current_date}
+            )
+            is_blob = safe_tool_invoke(
+                get_income_statement,
+                {"ticker": ticker, "freq": "quarterly", "curr_date": current_date}
+            )
 
-        result = chain.invoke(state["messages"])
-
-        report = ""
-
-        if len(result.tool_calls) == 0:
-            report = result.content
+            local_prompt = (
+                f"{system_message}\n\n"
+                "NOTE: You are running in LOCAL mode. The required tools have already "
+                "been executed for you. Do NOT request tools; analyze the retrieved "
+                "data below directly.\n\n"
+                f"Ticker: {ticker}\nTrade date: {current_date}\n\n"
+                f"## Company fundamentals\n{fundamentals_blob}\n\n"
+                f"## Balance sheet (quarterly)\n{bs_blob}\n\n"
+                f"## Cashflow (quarterly)\n{cf_blob}\n\n"
+                f"## Income statement (quarterly)\n{is_blob}"
+            )
+            result = llm.invoke(local_prompt)
+            report = getattr(result, "content", "")
+            ensure_tool_calls_attr(result)
+        else:
+            chain = prompt | llm.bind_tools(tools)
+            result = chain.invoke(state["messages"])
+            report = ""
+            if len(result.tool_calls) == 0:
+                report = result.content
 
         return {
             "messages": [result],

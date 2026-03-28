@@ -28,6 +28,32 @@ def build_instrument_context(ticker: str) -> str:
         "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`)."
     )
 
+
+def is_local_qwen_like(llm) -> bool:
+    """Return True for the LocalQwen adapter or a thin wrapper around it."""
+    if llm.__class__.__name__ == "LocalQwenChat":
+        return True
+    inner = getattr(llm, "inner", None)
+    return inner is not None and inner.__class__.__name__ == "LocalQwenChat"
+
+
+def ensure_tool_calls_attr(message) -> None:
+    """Keep graph routing safe when a local-path message has no tool calls."""
+    if hasattr(message, "tool_calls") and getattr(message, "tool_calls", None) is not None:
+        return
+    try:
+        message.tool_calls = []  # type: ignore[attr-defined]
+    except Exception:
+        setattr(message, "tool_calls", [])
+
+
+def safe_tool_invoke(tool, payload: dict) -> str:
+    """Run a tool and surface failures as text so local-mode analysis can continue."""
+    try:
+        return tool.invoke(payload)
+    except Exception as exc:
+        return f"ERROR running {tool.name}: {exc}"
+
 def create_msg_delete():
     def delete_messages(state):
         """Clear messages and add placeholder for Anthropic compatibility"""

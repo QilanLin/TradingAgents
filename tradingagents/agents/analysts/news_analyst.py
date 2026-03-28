@@ -1,10 +1,14 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 import time
 import json
+from datetime import datetime, timedelta
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
+    ensure_tool_calls_attr,
     get_global_news,
     get_news,
+    is_local_qwen_like,
+    safe_tool_invoke,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -12,6 +16,7 @@ from tradingagents.dataflows.config import get_config
 def create_news_analyst(llm):
     def news_analyst_node(state):
         current_date = state["trade_date"]
+        ticker = state["company_of_interest"]
         instrument_context = build_instrument_context(state["company_of_interest"])
 
         tools = [
@@ -46,13 +51,37 @@ def create_news_analyst(llm):
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        chain = prompt | llm.bind_tools(tools)
-        result = chain.invoke(state["messages"])
-
-        report = ""
-
-        if len(result.tool_calls) == 0:
-            report = result.content
+        if is_local_qwen_like(llm):
+            global_blob = safe_tool_invoke(
+                get_global_news,
+                {"curr_date": current_date, "look_back_days": 7, "limit": 12}
+            )
+            end_date = current_date
+            start_date = (
+                datetime.strptime(current_date, "%Y-%m-%d") - timedelta(days=7)
+            ).strftime("%Y-%m-%d")
+            company_blob = safe_tool_invoke(
+                get_news,
+                {"ticker": ticker, "start_date": start_date, "end_date": end_date}
+            )
+            local_prompt = (
+                f"{system_message}\n\n"
+                "NOTE: You are running in LOCAL mode. The required tools have already "
+                "been executed for you. Do NOT request tools; analyze the retrieved "
+                "data below directly.\n\n"
+                f"Ticker: {ticker}\nTrade date: {current_date}\n\n"
+                f"## Global / macro news (last 7 days)\n{global_blob}\n\n"
+                f"## Company-specific news (last 7 days)\n{company_blob}"
+            )
+            result = llm.invoke(local_prompt)
+            report = getattr(result, "content", "")
+            ensure_tool_calls_attr(result)
+        else:
+            chain = prompt | llm.bind_tools(tools)
+            result = chain.invoke(state["messages"])
+            report = ""
+            if len(result.tool_calls) == 0:
+                report = result.content
 
         return {
             "messages": [result],

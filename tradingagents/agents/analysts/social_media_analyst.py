@@ -1,13 +1,21 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 import time
 import json
-from tradingagents.agents.utils.agent_utils import build_instrument_context, get_news
+from datetime import datetime, timedelta
+from tradingagents.agents.utils.agent_utils import (
+    build_instrument_context,
+    ensure_tool_calls_attr,
+    get_news,
+    is_local_qwen_like,
+    safe_tool_invoke,
+)
 from tradingagents.dataflows.config import get_config
 
 
 def create_social_media_analyst(llm):
     def social_media_analyst_node(state):
         current_date = state["trade_date"]
+        ticker = state["company_of_interest"]
         instrument_context = build_instrument_context(state["company_of_interest"])
 
         tools = [
@@ -41,14 +49,33 @@ def create_social_media_analyst(llm):
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        chain = prompt | llm.bind_tools(tools)
-
-        result = chain.invoke(state["messages"])
-
-        report = ""
-
-        if len(result.tool_calls) == 0:
-            report = result.content
+        if is_local_qwen_like(llm):
+            end_date = current_date
+            start_date = (
+                datetime.strptime(current_date, "%Y-%m-%d") - timedelta(days=7)
+            ).strftime("%Y-%m-%d")
+            news_blob = safe_tool_invoke(
+                get_news,
+                {"ticker": ticker, "start_date": start_date, "end_date": end_date}
+            )
+            local_prompt = (
+                f"{system_message}\n\n"
+                "NOTE: You are running in LOCAL mode. The required tools have already "
+                "been executed for you. Do NOT request tools; analyze the retrieved "
+                "data below directly.\n\n"
+                f"Ticker: {ticker}\nTrade date: {current_date}\n"
+                f"Range: {start_date} -> {end_date}\n\n"
+                f"## Retrieved company news / discussions\n{news_blob}"
+            )
+            result = llm.invoke(local_prompt)
+            report = getattr(result, "content", "")
+            ensure_tool_calls_attr(result)
+        else:
+            chain = prompt | llm.bind_tools(tools)
+            result = chain.invoke(state["messages"])
+            report = ""
+            if len(result.tool_calls) == 0:
+                report = result.content
 
         return {
             "messages": [result],
