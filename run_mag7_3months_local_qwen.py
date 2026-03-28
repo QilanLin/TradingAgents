@@ -230,12 +230,9 @@ def main() -> None:
     # DEFAULT_CONFIG 里的默认值是 1 / 1，因此这里显式对齐回默认配置。
     cfg["max_debate_rounds"] = DEFAULT_CONFIG["max_debate_rounds"]
     cfg["max_risk_discuss_rounds"] = DEFAULT_CONFIG["max_risk_discuss_rounds"]
-    cfg["data_vendors"] = {
-        "core_stock_apis": "alpha_vantage",
-        "technical_indicators": "alpha_vantage",
-        "fundamental_data": "alpha_vantage",
-        "news_data": "alpha_vantage",
-    }
+    # Keep repository-default vendors here. Forcing every tool through Alpha Vantage
+    # makes smoke tests brittle because some endpoints are premium and the free quota
+    # is too small for a full multi-agent run.
 
     ta = tg.TradingAgentsGraph(debug=False, config=cfg)
     price_map = {t: load_prices(t) for t in TICKERS}
