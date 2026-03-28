@@ -58,6 +58,37 @@ def _load_cached_yfinance_history(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def warm_yfinance_history_cache(symbols: list[str]) -> list[dict[str, str | int]]:
+    results: list[dict[str, str | int]] = []
+
+    for raw_symbol in symbols:
+        symbol = raw_symbol.strip().upper()
+        if not symbol:
+            continue
+
+        data_file, _, _ = _yfinance_history_cache_path(symbol)
+        existed_before = os.path.exists(data_file)
+        data = _load_cached_yfinance_history(symbol)
+
+        if data.empty or "Date" not in data.columns:
+            status = "empty"
+            rows = 0
+        else:
+            status = "hit" if existed_before else "fetched"
+            rows = int(len(data))
+
+        results.append(
+            {
+                "symbol": symbol,
+                "status": status,
+                "rows": rows,
+                "path": data_file,
+            }
+        )
+
+    return results
+
+
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],

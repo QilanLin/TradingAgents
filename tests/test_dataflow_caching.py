@@ -14,7 +14,10 @@ from tradingagents.dataflows.alpha_vantage_common import _make_api_request
 from tradingagents.dataflows.cache_utils import get_or_fetch_cached_text, save_cached_text
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.yfinance_news import get_news_yfinance
-from tradingagents.dataflows.y_finance import get_YFin_data_online
+from tradingagents.dataflows.y_finance import (
+    get_YFin_data_online,
+    warm_yfinance_history_cache,
+)
 
 
 class DataflowCachingTests(unittest.TestCase):
@@ -165,6 +168,42 @@ class DataflowCachingTests(unittest.TestCase):
 
             self.assertIn("No data found", result)
             self.assertEqual(list(Path(tmpdir).glob("*YFin-data-*.csv")), [])
+
+    def test_warm_yfinance_history_cache_creates_shared_history_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_config(
+                {
+                    "data_cache_dir": tmpdir,
+                    "data_cache_ttl_seconds": 3600,
+                }
+            )
+
+            sample = pd.DataFrame(
+                {
+                    "Date": ["2025-09-02", "2025-09-03"],
+                    "Open": [100.0, 101.0],
+                    "High": [101.0, 102.0],
+                    "Low": [99.0, 100.0],
+                    "Close": [100.5, 101.5],
+                    "Volume": [1000, 1200],
+                }
+            )
+
+            with patch("tradingagents.dataflows.y_finance.yf.download", return_value=sample):
+                first = warm_yfinance_history_cache(["AAPL"])
+
+            self.assertEqual(first[0]["status"], "fetched")
+            self.assertEqual(first[0]["rows"], 2)
+            self.assertTrue(Path(first[0]["path"]).exists())
+
+            with patch(
+                "tradingagents.dataflows.y_finance.yf.download",
+                side_effect=RuntimeError("should not redownload"),
+            ):
+                second = warm_yfinance_history_cache(["AAPL"])
+
+            self.assertEqual(second[0]["status"], "hit")
+            self.assertEqual(second[0]["rows"], 2)
 
 
 if __name__ == "__main__":
