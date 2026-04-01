@@ -17,21 +17,12 @@ import tradingagents.graph.trading_graph as tg
 
 
 TICKERS = ["AAPL", "GOOGL", "AMZN", "MSFT", "META", "TSLA", "NVDA"]
-CASH_TICKER = "CASH"
 MONTHS = {
     "2025-09": ("2025-09-01", "2025-09-30"),
     "2025-10": ("2025-10-01", "2025-10-31"),
     "2026-01": ("2026-01-01", "2026-01-31"),
 }
 INITIAL_CAPITAL = 1_000_000.0
-RISK_FREE_RATE = 0.05
-RATING_SCORE = {
-    "BUY": 1.0,
-    "OVERWEIGHT": 0.75,
-    "HOLD": 0.5,
-    "UNDERWEIGHT": 0.25,
-    "SELL": 0.0,
-}
 
 PRICE_CANDIDATES = [
     "/root/private_data/experiments0202change/data_cache/price/{ticker}_plain_daily_2024-09-30_2025-09-30.csv",
@@ -54,6 +45,18 @@ def extract_rating(text: str) -> str:
         if token in upper:
             return token
     return "HOLD"
+
+
+def official_rating_rank(rating: str) -> int:
+    """Bridge official 5-level ratings into an ordinal rank for backtesting only."""
+    order = {
+        "BUY": 4,
+        "OVERWEIGHT": 3,
+        "HOLD": 2,
+        "UNDERWEIGHT": 1,
+        "SELL": 0,
+    }
+    return order.get(rating.upper(), 2)
 
 
 def load_prices(ticker: str) -> pd.Series:
@@ -157,16 +160,14 @@ def run_month(month: str, start: str, end: str, ta, price_map: Dict[str, pd.Seri
         t: (INITIAL_CAPITAL / len(TICKERS)) / float(price_map[t][first_day])
         for t in TICKERS
     }
-    cash = 0.0
 
     portfolio_values: List[float] = []
     daily_returns: List[float] = []
     prev_value = INITIAL_CAPITAL
-    base_slot_weight = 1.0 / len(TICKERS)
 
     for i, day in enumerate(all_days, start=1):
         prices = {t: float(price_map[t][day]) for t in TICKERS}
-        value = float(cash + sum(shares[t] * prices[t] for t in TICKERS))
+        value = float(sum(shares[t] * prices[t] for t in TICKERS))
         portfolio_values.append(value)
 
         dr = (value - prev_value) / prev_value if prev_value > 0 else 0.0
@@ -180,26 +181,19 @@ def run_month(month: str, start: str, end: str, ta, price_map: Dict[str, pd.Seri
             ratings[t] = rating
             decisions_writer.writerow([month, day, t, rating, signal])
 
-        # 更公平的 CASH-aware adapter：
-        # 每只股票先分到自己的基础槽位 1/7，再按 rating 决定占用该槽位的比例；
-        # 没有用掉的剩余权重全部进入现金，而不是把所有正分数强行归一化成满仓股票。
-        target_weights = {
-            t: base_slot_weight * RATING_SCORE.get(ratings[t], 0.5)
-            for t in TICKERS
-        }
-        cash_weight = max(0.0, 1.0 - sum(target_weights.values()))
+        raw_weights = {t: float(official_rating_rank(ratings[t])) for t in TICKERS}
+        weight_sum = sum(raw_weights.values())
+        if weight_sum <= 0:
+            target_weights = {t: 1.0 / len(TICKERS) for t in TICKERS}
+        else:
+            target_weights = {t: raw_weights[t] / weight_sum for t in TICKERS}
 
         shares = {
             t: (value * target_weights[t]) / prices[t] if prices[t] > 0 else 0.0
             for t in TICKERS
         }
-        cash = value * cash_weight
 
-        print(
-            f"[{month}] {i}/{len(all_days)} {day} value={value:.2f} "
-            f"cash_weight={cash_weight:.4f} ratings={ratings}",
-            flush=True,
-        )
+        print(f"[{month}] {i}/{len(all_days)} {day} value={value:.2f} ratings={ratings}", flush=True)
 
     final_value = portfolio_values[-1]
     total_return = final_value / INITIAL_CAPITAL - 1.0
@@ -207,8 +201,7 @@ def run_month(month: str, start: str, end: str, ta, price_map: Dict[str, pd.Seri
 
     ret_arr = np.array(daily_returns[1:], dtype=float) if len(daily_returns) > 1 else np.array([], dtype=float)
     if ret_arr.size > 1 and float(np.std(ret_arr)) > 0:
-        excess = ret_arr - (RISK_FREE_RATE / 252.0)
-        sharpe = float(math.sqrt(252.0) * np.mean(excess) / np.std(ret_arr))
+        sharpe = float(math.sqrt(252.0) * np.mean(ret_arr) / np.std(ret_arr))
     else:
         sharpe = 0.0
 
@@ -272,14 +265,11 @@ def main() -> None:
         "generated_utc": datetime.utcnow().isoformat() + "Z",
         "config": {
             "tickers": TICKERS,
-            "cash_ticker": CASH_TICKER,
             "months": MONTHS,
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "max_tokens": get_env_int("TRADINGAGENTS_LOCAL_QWEN_MAX_TOKENS", 20000),
             "max_debate_rounds": cfg["max_debate_rounds"],
             "max_risk_discuss_rounds": cfg["max_risk_discuss_rounds"],
-            "portfolio_adapter": "cash_aware_slot_fraction",
-            "rating_score": RATING_SCORE,
         },
         "monthly_results": [r.__dict__ for r in results],
     }
