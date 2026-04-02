@@ -14,7 +14,14 @@ from langchain_core.runnables import Runnable
 
 from tradingagents.default_config import DEFAULT_CONFIG
 import tradingagents.graph.trading_graph as tg
-from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows.config import get_config, set_config
+from tradingagents.dataflows.y_finance import (
+    get_balance_sheet as get_yf_balance_sheet,
+    get_cashflow as get_yf_cashflow,
+    get_fundamentals as get_yf_fundamentals,
+    get_income_statement as get_yf_income_statement,
+    get_insider_transactions as get_yf_insider_transactions,
+)
 
 
 TICKERS = ["AAPL", "GOOGL", "AMZN", "MSFT", "META", "TSLA", "NVDA"]
@@ -118,6 +125,32 @@ def seed_tradingagents_yfinance_history_cache(tickers: List[str]) -> List[str]:
         frame.to_csv(out_path, index=False)
         seeded.append(str(out_path))
     return seeded
+
+
+def prewarm_yfinance_text_cache(tickers: List[str]) -> List[dict[str, str]]:
+    """Pre-populate slow yfinance text endpoints into vendor_cache before graph runs."""
+    results: List[dict[str, str]] = []
+    for ticker in tickers:
+        tasks = [
+            ("fundamentals", lambda t=ticker: get_yf_fundamentals(t)),
+            ("balance_sheet_q", lambda t=ticker: get_yf_balance_sheet(t, "quarterly")),
+            ("cashflow_q", lambda t=ticker: get_yf_cashflow(t, "quarterly")),
+            ("income_statement_q", lambda t=ticker: get_yf_income_statement(t, "quarterly")),
+            ("insider_transactions", lambda t=ticker: get_yf_insider_transactions(t)),
+        ]
+        for name, func in tasks:
+            payload = func()
+            status = "ok"
+            if isinstance(payload, str) and payload.startswith("Error "):
+                status = "error"
+            results.append(
+                {
+                    "ticker": ticker,
+                    "dataset": name,
+                    "status": status,
+                }
+            )
+    return results
 
 
 def load_prices(ticker: str) -> pd.Series:
@@ -284,10 +317,18 @@ def main() -> None:
     # Keep repository-default vendors here. Forcing every tool through Alpha Vantage
     # makes smoke tests brittle because some endpoints are premium and the free quota
     # is too small for a full multi-agent run.
+    set_config(cfg)
 
     seeded_paths = seed_tradingagents_yfinance_history_cache(TICKERS)
     print(
         f"[CACHE] Seeded TradingAgents yfinance history cache for {len(seeded_paths)} tickers",
+        flush=True,
+    )
+    text_cache_results = prewarm_yfinance_text_cache(TICKERS)
+    text_cache_ok = sum(item["status"] == "ok" for item in text_cache_results)
+    text_cache_err = sum(item["status"] != "ok" for item in text_cache_results)
+    print(
+        f"[CACHE] Prewarmed yfinance text cache entries: ok={text_cache_ok} error={text_cache_err}",
         flush=True,
     )
 
