@@ -14,6 +14,7 @@ from langchain_core.runnables import Runnable
 
 from tradingagents.default_config import DEFAULT_CONFIG
 import tradingagents.graph.trading_graph as tg
+from tradingagents.dataflows.config import get_config
 
 
 TICKERS = ["AAPL", "GOOGL", "AMZN", "MSFT", "META", "TSLA", "NVDA"]
@@ -59,26 +60,70 @@ def official_rating_rank(rating: str) -> int:
     return order.get(rating.upper(), 2)
 
 
-def load_prices(ticker: str) -> pd.Series:
+def load_price_frame(ticker: str) -> pd.DataFrame:
+    """Load and normalize merged OHLCV frames from local experiment caches."""
     frames: List[pd.DataFrame] = []
     for pat in PRICE_CANDIDATES:
         path = pat.format(ticker=ticker)
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            if "date" not in df.columns:
-                continue
-            close_col = "raw_close" if "raw_close" in df.columns else "close"
-            if close_col not in df.columns:
-                continue
-            frames.append(df[["date", close_col]].rename(columns={close_col: "close"}))
+        if not os.path.exists(path):
+            continue
+        df = pd.read_csv(path)
+        if "date" not in df.columns:
+            continue
+        close_col = "adjusted_close" if "adjusted_close" in df.columns else "close"
+        if close_col not in df.columns:
+            continue
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(df["date"], errors="coerce"),
+                "Open": pd.to_numeric(df.get("open"), errors="coerce"),
+                "High": pd.to_numeric(df.get("high"), errors="coerce"),
+                "Low": pd.to_numeric(df.get("low"), errors="coerce"),
+                "Close": pd.to_numeric(df.get(close_col), errors="coerce"),
+                "Adj Close": pd.to_numeric(df.get(close_col), errors="coerce"),
+                "Raw Close": pd.to_numeric(
+                    df.get("raw_close", df.get(close_col)), errors="coerce"
+                ),
+                "Volume": pd.to_numeric(df.get("volume"), errors="coerce").fillna(0),
+            }
+        )
+        frame = frame.dropna(subset=["Date", "Close"])
+        frames.append(frame)
+
     if not frames:
         raise RuntimeError(f"No price files found for {ticker}")
 
     merged = pd.concat(frames, ignore_index=True)
-    merged["date"] = pd.to_datetime(merged["date"])
-    merged = merged.dropna(subset=["close"]).drop_duplicates(subset=["date"], keep="last")
-    merged = merged.sort_values("date")
-    s = pd.Series(merged["close"].values, index=merged["date"].dt.strftime("%Y-%m-%d"))
+    merged = merged.drop_duplicates(subset=["Date"], keep="last").sort_values("Date")
+    merged["Date"] = merged["Date"].dt.strftime("%Y-%m-%d")
+    merged["Volume"] = merged["Volume"].astype(int)
+    return merged.reset_index(drop=True)
+
+
+def seed_tradingagents_yfinance_history_cache(tickers: List[str]) -> List[str]:
+    """Pre-populate TradingAgents' yfinance history cache from local price snapshots."""
+    config = get_config()
+    cache_dir = Path(config["data_cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    today_date = pd.Timestamp.today()
+    start_date = today_date - pd.DateOffset(years=15)
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = today_date.strftime("%Y-%m-%d")
+
+    seeded: List[str] = []
+    for ticker in tickers:
+        frame = load_price_frame(ticker)
+        out_path = cache_dir / f"{ticker.upper()}-YFin-data-{start_date_str}-{end_date_str}.csv"
+        frame.to_csv(out_path, index=False)
+        seeded.append(str(out_path))
+    return seeded
+
+
+def load_prices(ticker: str) -> pd.Series:
+    frame = load_price_frame(ticker)
+    close_series = frame["Raw Close"] if "Raw Close" in frame.columns else frame["Close"]
+    s = pd.Series(close_series.values, index=frame["Date"])
     return s
 
 
@@ -239,6 +284,12 @@ def main() -> None:
     # Keep repository-default vendors here. Forcing every tool through Alpha Vantage
     # makes smoke tests brittle because some endpoints are premium and the free quota
     # is too small for a full multi-agent run.
+
+    seeded_paths = seed_tradingagents_yfinance_history_cache(TICKERS)
+    print(
+        f"[CACHE] Seeded TradingAgents yfinance history cache for {len(seeded_paths)} tickers",
+        flush=True,
+    )
 
     ta = tg.TradingAgentsGraph(debug=False, config=cfg)
     price_map = {t: load_prices(t) for t in TICKERS}
