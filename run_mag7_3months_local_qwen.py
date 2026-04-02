@@ -253,11 +253,19 @@ def run_month(month: str, start: str, end: str, ta, price_map: Dict[str, pd.Seri
         prev_value = value
 
         ratings = {}
-        for t in TICKERS:
+        for ticker_idx, t in enumerate(TICKERS, start=1):
+            print(
+                f"[{month}] day {i}/{len(all_days)} {day} ticker {ticker_idx}/{len(TICKERS)} {t} start",
+                flush=True,
+            )
             _, signal = ta.propagate(t, day)
             rating = extract_rating(signal)
             ratings[t] = rating
             decisions_writer.writerow([month, day, t, rating, signal])
+            print(
+                f"[{month}] day {i}/{len(all_days)} {day} ticker {ticker_idx}/{len(TICKERS)} {t} done rating={rating}",
+                flush=True,
+            )
 
         raw_weights = {t: float(official_rating_rank(ratings[t])) for t in TICKERS}
         weight_sum = sum(raw_weights.values())
