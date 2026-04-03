@@ -332,10 +332,23 @@ def main() -> None:
         cfg["deep_think_llm"] = qwen_model
         cfg["quick_think_llm"] = qwen_model
         backend_desc = "modelscope_api"
+    elif llm_backend == "openrouter":
+        cfg["llm_provider"] = "openrouter"
+        cfg["backend_url"] = get_env_str(
+            "OPENROUTER_BASE_URL",
+            "https://openrouter.ai/api/v1",
+        )
+        qwen_model = get_env_str(
+            "OPENROUTER_MODEL",
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        )
+        cfg["deep_think_llm"] = qwen_model
+        cfg["quick_think_llm"] = qwen_model
+        backend_desc = "openrouter_api"
     else:
         raise ValueError(
             f"Unsupported TRADINGAGENTS_QWEN_BACKEND={llm_backend!r}. "
-            "Expected 'local' or 'modelscope'."
+            "Expected 'local', 'modelscope', or 'openrouter'."
         )
 
     # 恢复为仓库默认轮数。
