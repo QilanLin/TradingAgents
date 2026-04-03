@@ -47,6 +47,13 @@ def get_env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def get_env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw
+
+
 def extract_rating(text: str) -> str:
     upper = (text or "").upper()
     for token in ["OVERWEIGHT", "UNDERWEIGHT", "BUY", "SELL", "HOLD"]:
@@ -304,12 +311,33 @@ def run_month(month: str, start: str, end: str, ta, price_map: Dict[str, pd.Seri
 
 
 def main() -> None:
-    tg.create_llm_client = patched_create_llm_client
-
+    llm_backend = get_env_str("TRADINGAGENTS_QWEN_BACKEND", "modelscope").strip().lower()
     cfg = DEFAULT_CONFIG.copy()
-    cfg["llm_provider"] = "openai"
-    cfg["deep_think_llm"] = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-    cfg["quick_think_llm"] = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    if llm_backend == "local":
+        tg.create_llm_client = patched_create_llm_client
+        cfg["llm_provider"] = "openai"
+        cfg["deep_think_llm"] = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        cfg["quick_think_llm"] = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        backend_desc = "local_qwen"
+    elif llm_backend == "modelscope":
+        cfg["llm_provider"] = "modelscope"
+        cfg["backend_url"] = get_env_str(
+            "MODELSCOPE_BASE_URL",
+            "https://api-inference.modelscope.cn/v1",
+        )
+        qwen_model = get_env_str(
+            "MODELSCOPE_MODEL",
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        )
+        cfg["deep_think_llm"] = qwen_model
+        cfg["quick_think_llm"] = qwen_model
+        backend_desc = "modelscope_api"
+    else:
+        raise ValueError(
+            f"Unsupported TRADINGAGENTS_QWEN_BACKEND={llm_backend!r}. "
+            "Expected 'local' or 'modelscope'."
+        )
+
     # 恢复为仓库默认轮数。
     # 这两个值之前被手工改成 0 / 0，会让这条 harness 跳过 Bear Researcher、
     # Conservative Analyst、Neutral Analyst，使结果不再代表默认 TradingAgents 流程。
@@ -337,6 +365,11 @@ def main() -> None:
     text_cache_err = sum(item["status"] != "ok" for item in text_cache_results)
     print(
         f"[CACHE] Prewarmed yfinance text cache entries: ok={text_cache_ok} error={text_cache_err}",
+        flush=True,
+    )
+    print(
+        f"[LLM] backend={backend_desc} provider={cfg['llm_provider']} "
+        f"model={cfg['deep_think_llm']}",
         flush=True,
     )
 
