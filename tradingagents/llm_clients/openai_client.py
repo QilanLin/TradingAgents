@@ -1,4 +1,6 @@
 import os
+import time
+from json import JSONDecodeError
 from typing import Any, Optional
 
 from langchain_openai import ChatOpenAI
@@ -15,8 +17,56 @@ class NormalizedChatOpenAI(ChatOpenAI):
     downstream handling.
     """
 
+    def __init__(
+        self,
+        *args,
+        provider_name: str = "openai",
+        transport_retries: int = 0,
+        transport_retry_delay: float = 2.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.provider_name = provider_name
+        self.transport_retries = max(0, int(transport_retries))
+        self.transport_retry_delay = float(transport_retry_delay)
+
     def invoke(self, input, config=None, **kwargs):
-        return normalize_content(super().invoke(input, config, **kwargs))
+        attempt = 0
+        delay = self.transport_retry_delay
+        while True:
+            try:
+                return normalize_content(super().invoke(input, config, **kwargs))
+            except Exception as exc:
+                if (
+                    attempt >= self.transport_retries
+                    or not _is_transient_compat_error(exc)
+                ):
+                    raise
+                attempt += 1
+                print(
+                    f"[LLM-RETRY] provider={self.provider_name} "
+                    f"attempt={attempt}/{self.transport_retries} "
+                    f"error={exc.__class__.__name__}: {exc}",
+                    flush=True,
+                )
+                time.sleep(delay)
+                delay *= 2
+
+
+def _is_transient_compat_error(exc: Exception) -> bool:
+    """Best-effort retry filter for flaky OpenAI-compatible backends."""
+    transient_names = {
+        "JSONDecodeError",
+        "APITimeoutError",
+        "APIConnectionError",
+        "InternalServerError",
+        "RateLimitError",
+    }
+    if exc.__class__.__name__ in transient_names:
+        return True
+    if isinstance(exc, JSONDecodeError):
+        return True
+    return False
 
 # Kwargs forwarded from user config to ChatOpenAI
 _PASSTHROUGH_KWARGS = (
@@ -78,6 +128,11 @@ class OpenAIClient(BaseLLMClient):
         # all model families. Third-party compatible providers use Chat Completions.
         if self.provider == "openai":
             llm_kwargs["use_responses_api"] = True
+
+        if self.provider != "openai":
+            llm_kwargs["provider_name"] = self.provider
+            llm_kwargs["transport_retries"] = self.kwargs.get("transport_retries", 2)
+            llm_kwargs["transport_retry_delay"] = self.kwargs.get("transport_retry_delay", 2.0)
 
         return NormalizedChatOpenAI(**llm_kwargs)
 
